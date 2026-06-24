@@ -8,6 +8,20 @@
       "when": 1782092963881,
       "tag": "0000_mysterious_ronan",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1782092964000,
+      "tag": "0001_create_chirps",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1782092965000,
+      "tag": "0002_add_hashed_password",
+      "breakpoints": true
     }
   ]
 }

@@ -1,17 +1,42 @@
 import express from "express";
 import { Request, Response, NextFunction } from "express";
 import { config } from "./config.js";
+import { db } from "./db/index.js";
+import * as schema from "./db/schema.js";
+import { checkPasswordHash, hashPassword } from "./auth.js";
+import { getAllChirps, getChirpById } from "./db/queries/chirps.js";
+import { getUserByEmail } from "./db/queries/users.js";
+import { randomUUID } from "crypto";
+import postgres from "postgres";
+import { migrate } from "drizzle-orm/postgres-js/migrator";
+import { drizzle } from "drizzle-orm/postgres-js";
+
+const migrationClient = postgres(config.db.url, { max: 1 });
+await migrate(drizzle(migrationClient), config.db.migrationConfig);
 
 const app = express();
 const PORT = 8080;
 
+// Helper to wrap async route handlers for error catching
+const asyncHandler = (fn: Function) => (req: Request, res: Response, next: NextFunction) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+
+app.get("/admin/metrics", handlerMetrics);
+
 app.use(express.json());
 app.use(middlewareLogResponses);
 app.use("/app", middlewareMetricsInc, express.static("./src/app"));
-app.get("/admin/metrics", handlerMetrics);
-app.post("/admin/reset", handlerReset);
-app.post("/api/validate_chirp", handlerValidateChirp);
+
+app.post("/admin/reset", asyncHandler(handlerReset));
+app.post("/api/users", asyncHandler(handlerCreateUser));
+app.post("/api/login", asyncHandler(handlerLogin));
+app.post("/api/chirps", asyncHandler(handlerCreateChirp));
+app.get("/api/chirps", asyncHandler(handlerGetChirps));
+app.get("/api/chirps/:chirpId", asyncHandler(handlerGetChirpById));
+
+// Error handler must be registered AFTER routes
 app.use(errorHandler);
+
 
 app.listen(PORT, () => {
   console.log(`Server is running at http://localhost:${PORT}`);
@@ -62,22 +87,90 @@ function handlerMetrics(req: Request, res: Response) {
     <html>
       <body>
         <h1>Welcome, Chirpy Admin</h1>
-        <p>Chirpy has been visited ${config.fileserverHits} times!</p>
+        <p>Chirpy has been visited ${config.api.fileserverHits} times!</p>
       </body>
     </html>`
     );
 }
 
-function handlerReset(req: Request, res: Response) {
-  config.fileserverHits = 0;
+async function handlerReset(req: Request, res: Response) {
+  if (config.api.platform !== "dev") {
+    res.status(403).json({ error: "Forbidden" });
+    return;
+  }
+
+  // delete all users but don't touch the schema
+  await migrationClient`DELETE FROM users`;
+
+  config.api.fileserverHits = 0;
   res.set("Content-Type", "text/plain; charset=utf-8");
   res.send("Hits: 0");
 }
 
-async function handlerValidateChirp(req: Request, res: Response) {
-  const { body } = req.body as { body: string };
+// validation was ported into handlerCreateChirp; old endpoint removed
 
-  if (typeof body !== "string") {
+async function handlerCreateUser(req: Request, res: Response) {
+  const { email, password } = req.body as { email?: string; password?: string };
+
+  if (typeof email !== "string" || typeof password !== "string") {
+    res.status(400).json({ error: "Invalid email or password" });
+    return;
+  }
+
+  try {
+    const hashedPassword = await hashPassword(password);
+    const [user] = await db
+      .insert(schema.users)
+      .values({ email, hashedPassword })
+      .returning();
+
+    res.status(201).json({
+      id: user.id,
+      email: user.email,
+      createdAt: new Date(user.createdAt).toISOString(),
+      updatedAt: new Date(user.updatedAt).toISOString(),
+    });
+  } catch (err) {
+    throw err as Error;
+  }
+}
+
+async function handlerLogin(req: Request, res: Response) {
+  const { email, password } = req.body as { email?: string; password?: string };
+
+  if (typeof email !== "string" || typeof password !== "string") {
+    res.status(401).json({ error: "incorrect email or password" });
+    return;
+  }
+
+  try {
+    const user = await getUserByEmail(email);
+    if (!user) {
+      res.status(401).json({ error: "incorrect email or password" });
+      return;
+    }
+
+    const passwordMatches = await checkPasswordHash(password, user.hashedPassword);
+    if (!passwordMatches) {
+      res.status(401).json({ error: "incorrect email or password" });
+      return;
+    }
+
+    res.status(200).json({
+      id: user.id,
+      email: user.email,
+      createdAt: new Date(user.createdAt).toISOString(),
+      updatedAt: new Date(user.updatedAt).toISOString(),
+    });
+  } catch {
+    res.status(401).json({ error: "incorrect email or password" });
+  }
+}
+
+async function handlerCreateChirp(req: Request, res: Response) {
+  const { userId, body } = req.body as { userId?: string; body?: string };
+
+  if (typeof userId !== "string" || typeof body !== "string") {
     res.status(400).json({ error: "Invalid request body" });
     return;
   }
@@ -88,12 +181,59 @@ async function handlerValidateChirp(req: Request, res: Response) {
 
   const sanitizedBody = body.replace(/(^|\s)(kerfuffle|sharbert|fornax)(?=$|\s)/gi, "$1****");
 
-  res.set("Content-Type", "application/json; charset=utf-8");
-  res.status(200).json({ cleanedBody: sanitizedBody });
+  const id = randomUUID();
+
+  try {
+    const [chirp] = await db
+      .insert(schema.chirps)
+      .values({ id, userId, body: sanitizedBody })
+      .returning();
+
+    res.status(201).json({
+      id: chirp.id,
+      createdAt: new Date(chirp.createdAt).toISOString(),
+      updatedAt: new Date(chirp.updatedAt).toISOString(),
+      body: chirp.body,
+      userId: chirp.userId,
+    });
+  } catch (err) {
+    throw err as Error;
+  }
+}
+
+async function handlerGetChirps(req: Request, res: Response) {
+  const chirps = await getAllChirps();
+  const response = chirps.map((chirp) => ({
+    id: chirp.id,
+    createdAt: new Date(chirp.createdAt).toISOString(),
+    updatedAt: new Date(chirp.updatedAt).toISOString(),
+    body: chirp.body,
+    userId: chirp.userId,
+  }));
+
+  res.status(200).json(response);
+}
+
+async function handlerGetChirpById(req: Request, res: Response) {
+  const { chirpId } = req.params as { chirpId: string };
+  const chirp = await getChirpById(chirpId);
+
+  if (!chirp) {
+    res.status(404).json({ error: "Chirp not found" });
+    return;
+  }
+
+  res.status(200).json({
+    id: chirp.id,
+    createdAt: new Date(chirp.createdAt).toISOString(),
+    updatedAt: new Date(chirp.updatedAt).toISOString(),
+    body: chirp.body,
+    userId: chirp.userId,
+  });
 }
 
 function middlewareMetricsInc(req: Request, res: Response, next: NextFunction) {
-  config.fileserverHits += 1;
+  config.api.fileserverHits += 1;
   next();
 }
 
