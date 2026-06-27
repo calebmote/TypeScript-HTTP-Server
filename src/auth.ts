@@ -1,5 +1,6 @@
 import argon2 from "argon2";
 import jwt from "jsonwebtoken";
+import type { Request } from "express";
 
 export async function hashPassword(password: string): Promise<string> {
   return argon2.hash(password);
@@ -24,4 +25,18 @@ export function validateJWT(tokenString: string, secret: string): string {
   } catch {
     throw new Error("invalid token");
   }
+}
+
+export function getBearerToken(req: Request): string {
+  const authHeader = req.get("Authorization");
+  if (!authHeader) {
+    throw new Error("missing Authorization header");
+  }
+
+  const match = authHeader.match(/^Bearer\s+(.+)$/);
+  if (!match) {
+    throw new Error("invalid Authorization header");
+  }
+
+  return match[1].trim();
 }

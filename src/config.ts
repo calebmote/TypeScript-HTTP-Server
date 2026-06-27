@@ -1,4 +1,3 @@
-import { Request, Response, NextFunction } from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 import type { MigrationConfig } from "drizzle-orm/migrator";
@@ -11,11 +10,13 @@ process.loadEnvFile(envPath);
 const envDBUrl = process.env.DB_URL;
 
 const envPlatform = process.env.PLATFORM ?? "";
+const envJWTSecret = process.env.JWT_SECRET;
 
 // include platform in API config
 export type APIConfig = {
   fileserverHits: number;
   platform: string;
+  jwtSecret: string;
 };
 
 export type DBConfig = {
@@ -32,12 +33,16 @@ if (!envDBUrl) {
   throw new Error("Environment variable DB_URL is required");
 }
 
+if (!envJWTSecret) {
+  throw new Error("Environment variable JWT_SECRET is required");
+}
+
 const migrationConfig: MigrationConfig = {
   migrationsFolder: path.resolve(__dirname, "..", "src", "db", "migrations"),
 };
 
 export const config: AppConfig = {
-  api: { fileserverHits: 0, platform: envPlatform },
+  api: { fileserverHits: 0, platform: envPlatform, jwtSecret: envJWTSecret },
   db: { url: envDBUrl, migrationConfig },
 };
 

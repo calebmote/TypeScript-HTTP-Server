@@ -2,7 +2,7 @@ import express from "express";
 import { config } from "./config.js";
 import { db } from "./db/index.js";
 import * as schema from "./db/schema.js";
-import { checkPasswordHash, hashPassword } from "./auth.js";
+import { checkPasswordHash, getBearerToken, hashPassword, makeJWT, validateJWT } from "./auth.js";
 import { getAllChirps, getChirpById } from "./db/queries/chirps.js";
 import { getUserByEmail } from "./db/queries/users.js";
 import { randomUUID } from "crypto";
@@ -109,7 +109,7 @@ async function handlerCreateUser(req, res) {
     }
 }
 async function handlerLogin(req, res) {
-    const { email, password } = req.body;
+    const { email, password, expiresInSeconds } = req.body;
     if (typeof email !== "string" || typeof password !== "string") {
         res.status(401).json({ error: "incorrect email or password" });
         return;
@@ -125,11 +125,18 @@ async function handlerLogin(req, res) {
             res.status(401).json({ error: "incorrect email or password" });
             return;
         }
+        const maxExpiration = 60 * 60;
+        const requestedExpiration = typeof expiresInSeconds === "number" && Number.isFinite(expiresInSeconds)
+            ? Math.floor(expiresInSeconds)
+            : maxExpiration;
+        const expirationSeconds = Math.min(Math.max(requestedExpiration, 1), maxExpiration);
+        const token = makeJWT(user.id, expirationSeconds, config.api.jwtSecret);
         res.status(200).json({
             id: user.id,
             email: user.email,
             createdAt: new Date(user.createdAt).toISOString(),
             updatedAt: new Date(user.updatedAt).toISOString(),
+            token,
         });
     }
     catch {
@@ -137,8 +144,16 @@ async function handlerLogin(req, res) {
     }
 }
 async function handlerCreateChirp(req, res) {
-    const { userId, body } = req.body;
-    if (typeof userId !== "string" || typeof body !== "string") {
+    const { body } = req.body;
+    let userId;
+    try {
+        const token = getBearerToken(req);
+        userId = validateJWT(token, config.api.jwtSecret);
+    }
+    catch {
+        throw new UnauthorizedError("invalid token");
+    }
+    if (typeof body !== "string") {
         res.status(400).json({ error: "Invalid request body" });
         return;
     }

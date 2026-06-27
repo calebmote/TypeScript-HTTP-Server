@@ -21,3 +21,14 @@ export function validateJWT(tokenString, secret) {
         throw new Error("invalid token");
     }
 }
+export function getBearerToken(req) {
+    const authHeader = req.get("Authorization");
+    if (!authHeader) {
+        throw new Error("missing Authorization header");
+    }
+    const match = authHeader.match(/^Bearer\s+(.+)$/);
+    if (!match) {
+        throw new Error("invalid Authorization header");
+    }
+    return match[1].trim();
+}
