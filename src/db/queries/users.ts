@@ -47,3 +47,18 @@ export async function revokeRefreshToken(token: string) {
 
   return result;
 }
+
+export async function upgradeUserToChirpyRed(userId: string) {
+  const now = new Date();
+
+  const [result] = await db
+    .update(users)
+    .set({
+      isChirpyRed: true,
+      updatedAt: now,
+    })
+    .where(eq(users.id, userId))
+    .returning();
+
+  return result;
+}

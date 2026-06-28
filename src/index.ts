@@ -6,6 +6,7 @@ import { db } from "./db/index.js";
 import * as schema from "./db/schema.js";
 import {
   checkPasswordHash,
+  getAPIKey,
   getBearerToken,
   hashPassword,
   makeJWT,
@@ -13,7 +14,12 @@ import {
   validateJWT,
 } from "./auth.js";
 import { getAllChirps, getChirpById } from "./db/queries/chirps.js";
-import { getUserByEmail, getUserFromRefreshToken, revokeRefreshToken } from "./db/queries/users.js";
+import {
+  getUserByEmail,
+  getUserFromRefreshToken,
+  revokeRefreshToken,
+  upgradeUserToChirpyRed,
+} from "./db/queries/users.js";
 import { randomUUID } from "crypto";
 import postgres from "postgres";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
@@ -45,6 +51,7 @@ app.post("/api/chirps", asyncHandler(handlerCreateChirp));
 app.delete("/api/chirps/:chirpId", asyncHandler(handlerDeleteChirp));
 app.get("/api/chirps", asyncHandler(handlerGetChirps));
 app.get("/api/chirps/:chirpId", asyncHandler(handlerGetChirpById));
+app.post("/api/polka/webhooks", asyncHandler(handlerPolkaWebhook));
 
 // Error handler must be registered AFTER routes
 app.use(errorHandler);
@@ -141,6 +148,7 @@ async function handlerCreateUser(req: Request, res: Response) {
       email: user.email,
       createdAt: new Date(user.createdAt).toISOString(),
       updatedAt: new Date(user.updatedAt).toISOString(),
+      isChirpyRed: user.isChirpyRed,
     });
   } catch (err) {
     throw err as Error;
@@ -187,6 +195,7 @@ async function handlerLogin(req: Request, res: Response) {
     email: user.email,
     createdAt: new Date(user.createdAt).toISOString(),
     updatedAt: new Date(user.updatedAt).toISOString(),
+    isChirpyRed: user.isChirpyRed,
     token,
     refreshToken,
   });
@@ -223,6 +232,7 @@ async function handlerUpdateUser(req: Request, res: Response) {
     email: updatedUser.email,
     createdAt: new Date(updatedUser.createdAt).toISOString(),
     updatedAt: new Date(updatedUser.updatedAt).toISOString(),
+    isChirpyRed: updatedUser.isChirpyRed,
   });
 }
 
@@ -332,7 +342,19 @@ async function handlerRevoke(req: Request, res: Response) {
 }
 
 async function handlerGetChirps(req: Request, res: Response) {
-  const chirps = await getAllChirps();
+  let authorId = "";
+  const authorIdQuery = req.query.authorId;
+  if (typeof authorIdQuery === "string") {
+    authorId = authorIdQuery;
+  }
+
+  let sort: "asc" | "desc" = "asc";
+  const sortQuery = req.query.sort;
+  if (sortQuery === "desc") {
+    sort = "desc";
+  }
+
+  const chirps = await getAllChirps(authorId || undefined, sort);
   const response = chirps.map((chirp) => ({
     id: chirp.id,
     createdAt: new Date(chirp.createdAt).toISOString(),
@@ -360,6 +382,45 @@ async function handlerGetChirpById(req: Request, res: Response) {
     body: chirp.body,
     userId: chirp.userId,
   });
+}
+
+async function handlerPolkaWebhook(req: Request, res: Response) {
+  let apiKey: string;
+  try {
+    apiKey = getAPIKey(req);
+  } catch {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+
+  if (apiKey !== config.api.polkaKey) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+
+  const { event, data } = req.body as {
+    event?: string;
+    data?: { userId?: string };
+  };
+
+  if (event !== "user.upgraded") {
+    res.status(204).send();
+    return;
+  }
+
+  const userId = data?.userId;
+  if (typeof userId !== "string") {
+    res.status(404).json({ error: "User not found" });
+    return;
+  }
+
+  const upgradedUser = await upgradeUserToChirpyRed(userId);
+  if (!upgradedUser) {
+    res.status(404).json({ error: "User not found" });
+    return;
+  }
+
+  res.status(204).send();
 }
 
 function middlewareMetricsInc(req: Request, res: Response, next: NextFunction) {

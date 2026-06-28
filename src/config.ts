@@ -11,12 +11,14 @@ const envDBUrl = process.env.DB_URL;
 
 const envPlatform = process.env.PLATFORM ?? "";
 const envJWTSecret = process.env.JWT_SECRET;
+const envPolkaKey = process.env.POLKA_KEY;
 
 // include platform in API config
 export type APIConfig = {
   fileserverHits: number;
   platform: string;
   jwtSecret: string;
+  polkaKey: string;
 };
 
 export type DBConfig = {
@@ -37,12 +39,21 @@ if (!envJWTSecret) {
   throw new Error("Environment variable JWT_SECRET is required");
 }
 
+if (!envPolkaKey) {
+  throw new Error("Environment variable POLKA_KEY is required");
+}
+
 const migrationConfig: MigrationConfig = {
   migrationsFolder: path.resolve(__dirname, "..", "src", "db", "migrations"),
 };
 
 export const config: AppConfig = {
-  api: { fileserverHits: 0, platform: envPlatform, jwtSecret: envJWTSecret },
+  api: {
+    fileserverHits: 0,
+    platform: envPlatform,
+    jwtSecret: envJWTSecret,
+    polkaKey: envPolkaKey,
+  },
   db: { url: envDBUrl, migrationConfig },
 };
 
