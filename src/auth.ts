@@ -1,6 +1,7 @@
 import argon2 from "argon2";
 import jwt from "jsonwebtoken";
 import type { Request } from "express";
+import { randomBytes } from "crypto";
 
 export async function hashPassword(password: string): Promise<string> {
   return argon2.hash(password);
@@ -40,3 +41,8 @@ export function getBearerToken(req: Request): string {
 
   return match[1].trim();
 }
+
+export function makeRefreshToken(): string {
+  return randomBytes(32).toString("hex");
+}
+

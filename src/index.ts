@@ -1,11 +1,19 @@
 import express from "express";
 import { Request, Response, NextFunction } from "express";
+import { eq } from "drizzle-orm";
 import { config } from "./config.js";
 import { db } from "./db/index.js";
 import * as schema from "./db/schema.js";
-import { checkPasswordHash, getBearerToken, hashPassword, makeJWT, validateJWT } from "./auth.js";
+import {
+  checkPasswordHash,
+  getBearerToken,
+  hashPassword,
+  makeJWT,
+  makeRefreshToken,
+  validateJWT,
+} from "./auth.js";
 import { getAllChirps, getChirpById } from "./db/queries/chirps.js";
-import { getUserByEmail } from "./db/queries/users.js";
+import { getUserByEmail, getUserFromRefreshToken, revokeRefreshToken } from "./db/queries/users.js";
 import { randomUUID } from "crypto";
 import postgres from "postgres";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
@@ -29,8 +37,12 @@ app.use("/app", middlewareMetricsInc, express.static("./src/app"));
 
 app.post("/admin/reset", asyncHandler(handlerReset));
 app.post("/api/users", asyncHandler(handlerCreateUser));
+app.put("/api/users", asyncHandler(handlerUpdateUser));
 app.post("/api/login", asyncHandler(handlerLogin));
+app.post("/api/refresh", asyncHandler(handlerRefresh));
+app.post("/api/revoke", asyncHandler(handlerRevoke));
 app.post("/api/chirps", asyncHandler(handlerCreateChirp));
+app.delete("/api/chirps/:chirpId", asyncHandler(handlerDeleteChirp));
 app.get("/api/chirps", asyncHandler(handlerGetChirps));
 app.get("/api/chirps/:chirpId", asyncHandler(handlerGetChirpById));
 
@@ -136,10 +148,9 @@ async function handlerCreateUser(req: Request, res: Response) {
 }
 
 async function handlerLogin(req: Request, res: Response) {
-  const { email, password, expiresInSeconds } = req.body as {
+  const { email, password } = req.body as {
     email?: string;
     password?: string;
-    expiresInSeconds?: number;
   };
 
   if (typeof email !== "string" || typeof password !== "string") {
@@ -147,37 +158,72 @@ async function handlerLogin(req: Request, res: Response) {
     return;
   }
 
-  try {
-    const user = await getUserByEmail(email);
-    if (!user) {
-      res.status(401).json({ error: "incorrect email or password" });
-      return;
-    }
-
-    const passwordMatches = await checkPasswordHash(password, user.hashedPassword);
-    if (!passwordMatches) {
-      res.status(401).json({ error: "incorrect email or password" });
-      return;
-    }
-
-    const maxExpiration = 60 * 60;
-    const requestedExpiration =
-      typeof expiresInSeconds === "number" && Number.isFinite(expiresInSeconds)
-        ? Math.floor(expiresInSeconds)
-        : maxExpiration;
-    const expirationSeconds = Math.min(Math.max(requestedExpiration, 1), maxExpiration);
-    const token = makeJWT(user.id, expirationSeconds, config.api.jwtSecret);
-
-    res.status(200).json({
-      id: user.id,
-      email: user.email,
-      createdAt: new Date(user.createdAt).toISOString(),
-      updatedAt: new Date(user.updatedAt).toISOString(),
-      token,
-    });
-  } catch {
+  const user = await getUserByEmail(email);
+  if (!user) {
     res.status(401).json({ error: "incorrect email or password" });
+    return;
   }
+
+  const passwordMatches = await checkPasswordHash(password, user.hashedPassword);
+  if (!passwordMatches) {
+    res.status(401).json({ error: "incorrect email or password" });
+    return;
+  }
+
+  const accessTokenExpirationSeconds = 60 * 60;
+  const token = makeJWT(user.id, accessTokenExpirationSeconds, config.api.jwtSecret);
+  const refreshToken = makeRefreshToken();
+  const refreshTokenExpiresAt = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000);
+
+  await db.insert(schema.refreshTokens).values({
+    token: refreshToken,
+    userId: user.id,
+    expiresAt: refreshTokenExpiresAt,
+    revokedAt: null,
+  });
+
+  res.status(200).json({
+    id: user.id,
+    email: user.email,
+    createdAt: new Date(user.createdAt).toISOString(),
+    updatedAt: new Date(user.updatedAt).toISOString(),
+    token,
+    refreshToken,
+  });
+}
+
+async function handlerUpdateUser(req: Request, res: Response) {
+  let userId: string;
+  try {
+    const token = getBearerToken(req);
+    userId = validateJWT(token, config.api.jwtSecret);
+  } catch {
+    throw new UnauthorizedError("invalid token");
+  }
+
+  const { email, password } = req.body as { email?: string; password?: string };
+  if (typeof email !== "string" || typeof password !== "string") {
+    res.status(400).json({ error: "Invalid email or password" });
+    return;
+  }
+
+  const hashedPassword = await hashPassword(password);
+  const [updatedUser] = await db
+    .update(schema.users)
+    .set({ email, hashedPassword })
+    .where(eq(schema.users.id, userId))
+    .returning();
+
+  if (!updatedUser) {
+    throw new UnauthorizedError("invalid token");
+  }
+
+  res.status(200).json({
+    id: updatedUser.id,
+    email: updatedUser.email,
+    createdAt: new Date(updatedUser.createdAt).toISOString(),
+    updatedAt: new Date(updatedUser.updatedAt).toISOString(),
+  });
 }
 
 async function handlerCreateChirp(req: Request, res: Response) {
@@ -220,6 +266,69 @@ async function handlerCreateChirp(req: Request, res: Response) {
   } catch (err) {
     throw err as Error;
   }
+}
+
+async function handlerDeleteChirp(req: Request, res: Response) {
+  const { chirpId } = req.params as { chirpId: string };
+
+  let userId: string;
+  try {
+    const token = getBearerToken(req);
+    userId = validateJWT(token, config.api.jwtSecret);
+  } catch {
+    throw new UnauthorizedError("invalid token");
+  }
+
+  const chirp = await getChirpById(chirpId);
+  if (!chirp) {
+    throw new NotFoundError("Chirp not found");
+  }
+
+  if (chirp.userId !== userId) {
+    throw new ForbiddenError("Forbidden");
+  }
+
+  await db.delete(schema.chirps).where(eq(schema.chirps.id, chirpId));
+  res.status(204).send();
+}
+
+async function handlerRefresh(req: Request, res: Response) {
+  let refreshToken: string;
+  try {
+    refreshToken = getBearerToken(req);
+  } catch {
+    res.status(401).json({ error: "invalid refresh token" });
+    return;
+  }
+
+  const user = await getUserFromRefreshToken(refreshToken);
+  if (!user) {
+    res.status(401).json({ error: "invalid refresh token" });
+    return;
+  }
+
+  const accessTokenExpirationSeconds = 60 * 60;
+  const token = makeJWT(user.id, accessTokenExpirationSeconds, config.api.jwtSecret);
+
+  res.status(200).json({ token });
+}
+
+async function handlerRevoke(req: Request, res: Response) {
+  let refreshToken: string;
+  try {
+    refreshToken = getBearerToken(req);
+  } catch {
+    res.status(401).json({ error: "invalid refresh token" });
+    return;
+  }
+
+  const revokedToken = await revokeRefreshToken(refreshToken);
+  if (!revokedToken) {
+    res.status(401).json({ error: "invalid refresh token" });
+    return;
+  }
+
+  res.status(204).send();
 }
 
 async function handlerGetChirps(req: Request, res: Response) {
